@@ -1,0 +1,76 @@
+name: Rebase issue 11833 contribution onto upstream main
+
+on:
+  push:
+    branches:
+      - automation/prepare-upstream-11833
+
+permissions:
+  contents: write
+
+jobs:
+  rebase-and-validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      UPSTREAM_SHA: bf330493f4352546ee2a3435eeb85d75d6328f1b
+      PATCH_SHA: e8d20fd15e2b530bfe6342655de02088e3e30e8f
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase the reviewed patch
+        run: |
+          git config user.name Marti
+          git config user.email 114810952+Marti-S@users.noreply.github.com
+          git reset --hard "$UPSTREAM_SHA"
+          git cherry-pick "$PATCH_SHA"
+
+      - name: Verify contribution shape
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD^)" = "$UPSTREAM_SHA"
+          test "$(git rev-list --count "$UPSTREAM_SHA"..HEAD)" = 1
+          git diff --name-only "$UPSTREAM_SHA" | sort > /tmp/actual-files
+          cat > /tmp/expected-files <<'EOF'
+          crates/wasmtime/src/runtime/component/concurrent.rs
+          crates/wasmtime/src/runtime/component/concurrent/func.rs
+          crates/wasmtime/src/runtime/component/concurrent/task.rs
+          crates/wasmtime/src/runtime/component/mod.rs
+          tests/all/component_model/async.rs
+          EOF
+          sort -o /tmp/expected-files /tmp/expected-files
+          diff -u /tmp/expected-files /tmp/actual-files
+          ! git log -1 --format=%B | grep -i '^co-authored-by:'
+
+      - name: Format and check patch hygiene
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check "$UPSTREAM_SHA"
+          git diff --exit-code
+
+      - name: Check component-model-async feature
+        run: cargo check -p wasmtime --no-default-features --features component-model-async
+
+      - name: Check public documentation links
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
+        run: cargo doc -p wasmtime --no-deps --features component-model-async
+
+      - name: Run task waiter unit tests
+        run: cargo test -p wasmtime --features component-model-async --lib task_done_ -- --nocapture
+
+      - name: Run concurrent cancellation integration tests
+        run: cargo test -p wasmtime-cli --test all 'component_model::r#async::cancel_call_concurrent_' -- --nocapture
+
+      - name: Run adjacent task tracking test
+        run: cargo test -p wasmtime-cli --test all 'component_model::r#async::async_call_stack' -- --exact --nocapture
+
+      - name: Publish clean contribution branches
+        run: |
+          git push --force origin \
+            HEAD:refs/heads/contrib/11833-call-concurrent-cancellation \
+            HEAD:refs/heads/fix/11833-call-concurrent-cancellation
