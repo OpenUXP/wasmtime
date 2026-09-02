@@ -16,6 +16,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       UPSTREAM_SHA: 7d4c8b4e8da8ad9d5ba65797baf75aa1ced7a0a6
       PATCH_SHA: e8d20fd15e2b530bfe6342655de02088e3e30e8f
+      PATCH_REF: refs/remotes/origin/fix/11833-call-concurrent-cancellation
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,8 +29,11 @@ jobs:
         run: |
           git config user.name Marti
           git config user.email 114810952+Marti-S@users.noreply.github.com
+          git fetch origin \
+            refs/heads/fix/11833-call-concurrent-cancellation:refs/remotes/origin/fix/11833-call-concurrent-cancellation
+          test "$(git rev-parse "$PATCH_REF")" = "$PATCH_SHA"
           git reset --hard "$UPSTREAM_SHA"
-          git cherry-pick "$PATCH_SHA"
+          git cherry-pick "$PATCH_REF"
 
       - name: Verify contribution shape
         shell: bash
