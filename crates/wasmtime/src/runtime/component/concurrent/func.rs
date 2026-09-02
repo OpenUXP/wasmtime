@@ -1,5 +1,5 @@
 use crate::component::concurrent::TaskId;
-use crate::component::concurrent::{self, GuestTaskId, PreparedCall};
+use crate::component::concurrent::{self, GuestTaskHandle, GuestTaskId, PreparedCall};
 use crate::component::func::LowerContext;
 use crate::component::{AsAccessor, ComponentNamedList, Func, Lift, Lower, TypedFunc, Val};
 use crate::prelude::*;
@@ -51,29 +51,37 @@ impl Func {
     ///
     /// # Cancellation
     ///
-    /// Cancelling an async task created via `call_concurrent`, at this time, is
-    /// only possible by dropping the store that the computation runs within.
-    /// With [#11833] implemented then it will be possible to request
-    /// cancellation of a task, but that is not yet implemented. Hard-cancelling
-    /// a task will only ever be possible by dropping the entire store and it is
-    /// not possible to remove just one task from a store.
+    /// To request cancellation, use [`Self::start_call_concurrent`] to obtain
+    /// a [`FuncCallConcurrent`], call [`FuncCallConcurrent::task_handle`], and
+    /// then call [`GuestTaskHandle::cancel`].
+    ///
+    /// If parameter lowering has not begun, the guest is not entered and the
+    /// call-result future returns an error which can be downcast to
+    /// [`GuestTaskCancelled`](crate::component::GuestTaskCancelled). Once
+    /// parameter lowering begins, cancellation is cooperative and asynchronous:
+    /// the guest may take an arbitrary amount of time to observe the request,
+    /// may ignore it, or may call `task.return` instead of `task.cancel`. If the
+    /// guest acknowledges cancellation with `task.cancel`, the same typed error
+    /// is returned. If the guest calls `task.return`, the result is returned
+    /// normally.
+    ///
+    /// A guest task's implicit thread may continue running after producing a
+    /// result. Use [`GuestTaskHandle::task_done`] to wait until that thread has
+    /// exited. Explicit threads created by the guest are outside this
+    /// completion condition. Hard cancellation of an individual task is not
+    /// supported; dropping the entire store remains the only way to forcibly
+    /// stop a non-cooperating task.
     ///
     /// This async function behaves more like a "spawn" than a normal Rust async
-    /// function. When this function is invoked then metadata for the function
-    /// call is recorded in the store connected to the `accessor` argument and
-    /// the wasm invocation is from then on connected to the store. If the
-    /// future created by this function is dropped it does not cancel the
-    /// in-progress execution of the wasm task. Dropping the future
-    /// relinquishes the host's ability to learn about the result of the task
-    /// but the task will still progress and invoke callbacks and such until
-    /// completion.
+    /// function. Dropping the returned future does not cancel the in-progress
+    /// guest task; it only relinquishes the host's ability to observe the call
+    /// result.
     ///
     /// This function will return an error if [`Config::concurrency_support`] is
     /// disabled.
     ///
     /// [`Config::concurrency_support`]: crate::Config::concurrency_support
     /// [`run_concurrent`]: crate::Store::run_concurrent
-    /// [#11833]: https://github.com/bytecodealliance/wasmtime/issues/11833
     /// [`Accessor`]: crate::component::Accessor
     ///
     /// # Panics
@@ -201,12 +209,19 @@ impl Func {
 }
 
 impl<T> FuncCallConcurrent<'_, T> {
-    /// Returns the task that this invocation corresponds to.
+    /// Returns the diagnostic identifier for the task represented by this call.
     ///
     /// This can be later correlated with [`StoreContextMut::async_call_stack`]
     /// for example.
     pub fn task(&self) -> GuestTaskId {
         self.call.task()
+    }
+
+    /// Returns a handle which may be used to request cancellation with
+    /// [`GuestTaskHandle::cancel`] or wait for the call's implicit thread to
+    /// exit with [`GuestTaskHandle::task_done`].
+    pub fn task_handle(&self) -> GuestTaskHandle {
+        self.call.task_handle()
     }
 }
 
@@ -487,11 +502,18 @@ where
 }
 
 impl<T, P, R> TypedFuncCallConcurrent<T, P, R> {
-    /// Returns the task that this invocation corresponds to.
+    /// Returns the diagnostic identifier for the task represented by this call.
     ///
     /// This can be later correlated with [`StoreContextMut::async_call_stack`]
     /// for example.
     pub fn task(&self) -> GuestTaskId {
         self.call.task()
+    }
+
+    /// Returns a handle which may be used to request cancellation with
+    /// [`GuestTaskHandle::cancel`] or wait for the call's implicit thread to
+    /// exit with [`GuestTaskHandle::task_done`].
+    pub fn task_handle(&self) -> GuestTaskHandle {
+        self.call.task_handle()
     }
 }

@@ -18,8 +18,12 @@
 //!
 //! ## Top-level API (e.g. kicking off host->guest calls and driving the event loop)
 //!
-//! - `[Typed]Func::call_concurrent`: Start a host->guest call to an
-//! async-lifted or sync-lifted import, creating a guest task.
+//! - `[Typed]Func::{call_concurrent,start_call_concurrent}`: Start a
+//! host->guest call to an async-lifted or sync-lifted export, creating a guest
+//! task. The `start_*` forms expose a [`GuestTaskHandle`] immediately.
+//!
+//! - [`GuestTaskHandle`]: Request cancellation and wait for the guest
+//! task's implicit thread to exit.
 //!
 //! - `StoreContextMut::run_concurrent`: Run the event loop for the specified
 //! instance, allowing any and all tasks belonging to that instance to make
@@ -107,6 +111,7 @@ pub use futures_and_streams::{
     StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
 };
 pub(crate) use futures_and_streams::{ResourcePair, lower_error_context_to_index};
+pub use task::{GuestTaskCancelled, GuestTaskHandle};
 
 mod abort;
 mod error_contexts;
@@ -114,6 +119,7 @@ mod func;
 mod future_stream_any;
 mod futures_and_streams;
 pub(crate) mod table;
+mod task;
 pub(crate) mod tls;
 
 /// Constant defined in the Component Model spec to indicate that the async
@@ -1879,6 +1885,7 @@ impl StoreOpaque {
             } else {
                 Caller::Host {
                     tx: None,
+                    task_handle_state: None,
                     host_future_present: false,
                     caller: thread,
                 }
@@ -2362,6 +2369,13 @@ impl StoreOpaque {
         let ready_to_delete = task.ready_to_delete();
 
         if !task.decremented_interesting_task_count && task.exited && task.returned_or_cancelled() {
+            let task_handle_state = match &task.caller {
+                Caller::Host {
+                    task_handle_state, ..
+                } => task_handle_state.clone(),
+                Caller::Guest { .. } => None,
+            };
+
             task.decremented_interesting_task_count = true;
 
             debug_assert!(state.interesting_tasks > 0);
@@ -2370,6 +2384,9 @@ impl StoreOpaque {
                 && let Some(waker) = state.interesting_tasks_empty_waker.take()
             {
                 waker.wake();
+            }
+            if let Some(task_handle_state) = task_handle_state {
+                task_handle_state.complete();
             }
         }
 
@@ -2392,11 +2409,12 @@ impl StoreOpaque {
     /// actually run any wasm code yet. This requires cleaning up metadata such
     /// as thread information attached to the task.
     ///
-    /// The main two entrypoints for this function are:
+    /// The main entry points for this function are:
     ///
-    /// * Task cancellation via `subtask.cancel`, the intrinsic.
-    /// * Dropping a host `call_async` future which needs to cancel the task
-    ///   because it cannot reference its parameters any more.
+    /// * Guest cancellation via the `subtask.cancel` intrinsic.
+    /// * Host cancellation via [`GuestTaskHandle::cancel`].
+    /// * Dropping a host call future before parameter lowering, after which
+    ///   the lowering closure may no longer reference its parameters.
     fn cancel_guest_subtask_without_lowered_parameters(
         &mut self,
         caller_instance: RuntimeInstance,
@@ -2405,36 +2423,143 @@ impl StoreOpaque {
         let concurrent_state = self.concurrent_state_mut()?;
         let task = concurrent_state.get_mut(guest_task)?;
         assert!(!task.already_lowered_parameters());
-        // The task is in a `starting` state, meaning it hasn't run at
-        // all yet.  Here we update its fields to indicate that it is
-        // ready to delete immediately once `subtask.drop` is called.
         task.lower_params = None;
         task.lift_result = None;
+        task.cancelled = true;
         task.exited = true;
         let instance = task.instance;
+        assert_eq!(task.threads.len(), 1);
+        let thread = QualifiedThreadId {
+            task: guest_task,
+            thread: *task.threads.iter().next().unwrap(),
+        };
 
-        // Clean up the thread within this task as it's now never going
-        // to run.
-        assert_eq!(1, task.threads.len());
-        let thread = *task.threads.iter().next().unwrap();
-        self.cleanup_thread(
-            QualifiedThreadId {
-                task: guest_task,
-                thread,
-            },
-            caller_instance,
-            CleanupTask::No,
-        )?;
+        let removed_from_queue = concurrent_state.remove_guest_task_work_items(guest_task);
 
-        // Not yet started; cancel and remove from pending
         let pending = &mut self.instance_state(instance).concurrent_state().pending;
         let pending_count = pending.len();
         pending.retain(|thread, _| thread.task != guest_task);
-        // If there were no pending threads for this task, we're in an error state
-        if pending.len() == pending_count {
+        let removed_from_pending = pending.len() != pending_count;
+
+        if !removed_from_queue && !removed_from_pending {
             bail!(Trap::SubtaskCancelAfterTerminal);
         }
+
+        self.cleanup_thread(thread, caller_instance, CleanupTask::No)?;
+
         Ok(())
+    }
+
+    /// Request cooperative cancellation for the specified guest task.
+    ///
+    /// `cancel_after_return` controls whether a task that has already produced
+    /// its call result may still receive the request. Host-owned task handles
+    /// enable this because a guest task may outlive its result.
+    ///
+    /// `delivery` controls whether a cancellable task is selected as the next
+    /// deterministic switch target for guest `subtask.cancel`, or promoted to
+    /// the high-priority queue for host cancellation.
+    fn request_guest_task_cancellation(
+        &mut self,
+        guest_task: TableId<GuestTask>,
+        cancel_after_return: CancelAfterReturn,
+        delivery: CancellationDelivery,
+    ) -> Result<GuestTaskCancellation> {
+        let state = self.concurrent_state_mut()?;
+        let (runtime_instance, threads) = {
+            let task = state.get_mut(guest_task)?;
+            if task.cancelled
+                || (matches!(cancel_after_return, CancelAfterReturn::No)
+                    && task.returned_or_cancelled())
+            {
+                return Ok(GuestTaskCancellation {
+                    runtime_instance: task.instance,
+                    switched: false,
+                });
+            }
+
+            task.cancel_sent = true;
+            // This may overwrite `Event::None` or a previous cancellation
+            // event, which is intentional: cancellation supersedes both.
+            task.event = Some(Event::Cancelled);
+            (task.instance, task.threads.clone())
+        };
+
+        let mut switched = false;
+        for thread_id in threads {
+            let thread = QualifiedThreadId {
+                task: guest_task,
+                thread: thread_id,
+            };
+
+            if let Some(set) = state.get_mut(thread.thread)?.wake_on_cancel.take() {
+                let item = match state.get_mut(set)?.waiting.remove(&thread) {
+                    Some(WaitMode::Fiber(fiber)) => WorkItem::ResumeFiber {
+                        instance: runtime_instance,
+                        thread,
+                        fiber,
+                    },
+                    Some(WaitMode::Callback(instance)) => WorkItem::GuestCall {
+                        instance: runtime_instance,
+                        call: GuestCall {
+                            thread,
+                            kind: GuestCallKind::DeliverEvent {
+                                instance,
+                                set: None,
+                            },
+                        },
+                    },
+                    Some(WaitMode::Caller { .. }) => {
+                        bail_bug!("unexpected `WaitMode::Caller` in wake_on_cancel set")
+                    }
+                    None => bail_bug!("thread not present in wake_on_cancel set"),
+                };
+
+                match delivery {
+                    CancellationDelivery::Switch => {
+                        state.set_switch_item(item)?;
+                        switched = true;
+                    }
+                    CancellationDelivery::HighPriority => state.push_high_priority(item),
+                }
+                break;
+            }
+
+            if matches!(delivery, CancellationDelivery::HighPriority)
+                && state.promote_callback_work_item_to_high_priority(thread)
+            {
+                break;
+            }
+
+            let cancellable = matches!(
+                &state.get_mut(thread.thread)?.state,
+                GuestThreadState::Ready {
+                    cancellable: true,
+                    ..
+                }
+            );
+            if cancellable {
+                match delivery {
+                    CancellationDelivery::Switch => {
+                        if !state.promote_thread_work_item(thread)? {
+                            bail_bug!("a ready thread should have been promotable");
+                        }
+                        switched = true;
+                    }
+                    CancellationDelivery::HighPriority => {
+                        if !state.promote_thread_work_item_to_high_priority(thread) {
+                            bail_bug!("a ready thread should have a queued work item");
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        Ok(GuestTaskCancellation {
+            runtime_instance,
+            switched,
+        })
     }
 
     /// Used by `ResourceTables` to record the scope of a borrow to get undone
@@ -2498,6 +2623,23 @@ impl StoreOpaque {
                     .do_not_suspend
             }))
     }
+}
+
+struct GuestTaskCancellation {
+    runtime_instance: RuntimeInstance,
+    switched: bool,
+}
+
+#[derive(Copy, Clone)]
+enum CancelAfterReturn {
+    No,
+    Yes,
+}
+
+#[derive(Copy, Clone)]
+enum CancellationDelivery {
+    Switch,
+    HighPriority,
 }
 
 enum CleanupTask {
@@ -3571,7 +3713,7 @@ impl Instance {
             .ok_or_else(|| Trap::TaskCancelOrReturnTwice)?;
 
         if !task.result.is_none() {
-            bail_bug!("task result should not bet set yet");
+            bail_bug!("task result should not be set yet");
         }
 
         log::trace!("task.cancel for {guest_thread:?}");
@@ -3603,8 +3745,15 @@ impl Instance {
         let state = store.concurrent_state_mut()?;
         let task = state.get_mut(guest_task)?;
 
+        task.cancelled = status == Status::ReturnCancelled;
+
         if let Caller::Host { tx, .. } = &mut task.caller {
             if let Some(tx) = tx.take() {
+                let result = match status {
+                    Status::Returned => HostCallResult::Returned(result),
+                    Status::ReturnCancelled => HostCallResult::Cancelled,
+                    _ => bail_bug!("invalid terminal status for host call: {status:?}"),
+                };
                 _ = tx.send(result);
             }
         } else {
@@ -4215,118 +4364,66 @@ impl Instance {
             }
         } else {
             let guest_task = TableId::<GuestTask>::new(rep);
-            let task = concurrent_state.get_mut(guest_task)?;
-            if !task.already_lowered_parameters() {
+            let already_lowered = concurrent_state
+                .get_mut(guest_task)?
+                .already_lowered_parameters();
+            if !already_lowered {
                 store.cancel_guest_subtask_without_lowered_parameters(
                     self.runtime_instance(caller_instance),
                     guest_task,
                 )?;
                 return Ok(Status::StartCancelled as u32);
-            } else if !task.returned_or_cancelled() {
-                // Started, but not yet returned or cancelled; send the
-                // `CANCELLED` event
-                task.cancel_sent = true;
-                // Note that this might overwrite an event that was set earlier
-                // (e.g. `Event::None` if the task is yielding, or
-                // `Event::Cancelled` if it was already cancelled), but that's
-                // okay -- this should supersede the previous state.
-                task.event = Some(Event::Cancelled);
-                let runtime_instance = task.instance;
-                for thread in task.threads.clone() {
-                    let thread = QualifiedThreadId {
-                        task: guest_task,
-                        thread,
-                    };
-                    let thread_mut = concurrent_state.get_mut(thread.thread)?;
-
-                    let yield_ = |store: &mut StoreOpaque| {
-                        // While we're yielding, temporarily set
-                        // `do_not_suspend` to false on the subtask's instance
-                        // since we'll be getting control back if it does
-                        // suspend.
-                        let state = store.instance_state(runtime_instance).concurrent_state();
-                        let old_do_not_suspend = state.do_not_suspend;
-                        state.do_not_suspend = false;
-
-                        let caller = store.current_guest_thread()?;
-
-                        // Temporarily add the waitable to the caller's
-                        // `sync_call_set` to ensure that (1) it isn't already
-                        // part of a different set and (2) it can't be added to
-                        // a different set while we yield to the subtask.
-                        let state = store.concurrent_state_mut()?;
-                        let set = state.get_mut(caller.thread)?.sync_call_set;
-                        waitable.join(state, Some(set))?;
-
-                        store.suspend(SuspendReason::Yielding {
-                            thread: caller,
-                            cancellable: false,
-                        })?;
-
-                        let state = store.concurrent_state_mut()?;
-                        waitable.join(state, None)?;
-
-                        store
-                            .instance_state(runtime_instance)
-                            .concurrent_state()
-                            .do_not_suspend = old_do_not_suspend;
-
-                        Ok::<(), crate::Error>(())
-                    };
-
-                    if let Some(set) = thread_mut.wake_on_cancel.take() {
-                        // The thread is in a cancellable wait, so wake it up:
-                        let item = match concurrent_state.get_mut(set)?.waiting.remove(&thread) {
-                            Some(WaitMode::Fiber(fiber)) => WorkItem::ResumeFiber {
-                                instance: runtime_instance,
-                                thread,
-                                fiber,
-                            },
-                            Some(WaitMode::Callback(instance)) => WorkItem::GuestCall {
-                                instance: runtime_instance,
-                                call: GuestCall {
-                                    thread,
-                                    kind: GuestCallKind::DeliverEvent {
-                                        instance,
-                                        set: None,
-                                    },
-                                },
-                            },
-                            Some(WaitMode::Caller { .. }) => {
-                                bail_bug!("unexpected `WaitMode::Caller` in wake_on_cancel set")
-                            }
-                            None => bail_bug!("thread not present in wake_on_cancel set"),
-                        };
-                        concurrent_state.set_switch_item(item)?;
-
-                        yield_(store)?;
-
-                        break;
-                    } else if let GuestThreadState::Ready {
-                        cancellable: true, ..
-                    } = &thread_mut.state
-                    {
-                        // The thread is in a cancellable yield, so yield back
-                        // to it.
-                        if !concurrent_state.promote_thread_work_item(thread)? {
-                            bail_bug!("a ready thread should have been promotable");
-                        }
-
-                        yield_(store)?;
-
-                        break;
-                    }
-                }
-
-                // Guest tasks need to block if they have not yet returned or
-                // cancelled, even as a result of the event delivery above.
-                needs_block = !store
-                    .concurrent_state_mut()?
-                    .get_mut(guest_task)?
-                    .returned_or_cancelled()
-            } else {
-                needs_block = false;
             }
+
+            let cancellation = store.request_guest_task_cancellation(
+                guest_task,
+                CancelAfterReturn::No,
+                CancellationDelivery::Switch,
+            )?;
+            if cancellation.switched {
+                let runtime_instance = cancellation.runtime_instance;
+                let yield_ = |store: &mut StoreOpaque| {
+                    // While we're yielding, temporarily set `do_not_suspend`
+                    // to false on the subtask's instance since we'll be getting
+                    // control back if it does suspend.
+                    let state = store.instance_state(runtime_instance).concurrent_state();
+                    let old_do_not_suspend = state.do_not_suspend;
+                    state.do_not_suspend = false;
+
+                    let caller = store.current_guest_thread()?;
+
+                    // Temporarily add the waitable to the caller's
+                    // `sync_call_set` to ensure that (1) it isn't already part
+                    // of a different set and (2) it can't be added to a
+                    // different set while we yield to the subtask.
+                    let state = store.concurrent_state_mut()?;
+                    let set = state.get_mut(caller.thread)?.sync_call_set;
+                    waitable.join(state, Some(set))?;
+
+                    store.suspend(SuspendReason::Yielding {
+                        thread: caller,
+                        cancellable: false,
+                    })?;
+
+                    let state = store.concurrent_state_mut()?;
+                    waitable.join(state, None)?;
+
+                    store
+                        .instance_state(runtime_instance)
+                        .concurrent_state()
+                        .do_not_suspend = old_do_not_suspend;
+
+                    Ok::<(), crate::Error>(())
+                };
+                yield_(store)?;
+            }
+
+            // Event delivery above may have completed the task, so recompute
+            // whether the caller still needs to block.
+            needs_block = !store
+                .concurrent_state_mut()?
+                .get_mut(guest_task)?
+                .returned_or_cancelled();
         };
 
         // If we need to block waiting on the terminal status of this subtask
@@ -4337,8 +4434,8 @@ impl Instance {
                 return Ok(BLOCKED);
             }
 
-            // Wait for this waitable to get signaled with its terminal
-            // status. Once that's done fall through to the shared code.
+            // Wait for this waitable to get signaled with its terminal status.
+            // Once that's done fall through to the shared code.
             store.wait_for_event(
                 self.runtime_instance(caller_instance),
                 waitable,
@@ -4912,7 +5009,9 @@ enum Caller {
     /// The host called the guest task.
     Host {
         /// If present, may be used to deliver the result.
-        tx: Option<oneshot::Sender<LiftedResult>>,
+        tx: Option<oneshot::Sender<HostCallResult>>,
+        /// State shared with any host-owned guest task handles for this call.
+        task_handle_state: Option<task::GuestTaskHandleState>,
         /// If true, there's a host future that must be dropped before the task
         /// can be deleted.
         host_future_present: bool,
@@ -5127,9 +5226,12 @@ pub(crate) struct GuestTask {
     /// A place to stash the lowered result for a sync-to-async call until it
     /// can be returned to the caller.
     sync_result: SyncResult,
-    /// Whether or not the task has been cancelled (i.e. whether the task is
-    /// permitted to call `task.cancel`).
+    /// Whether a cancellation request has been sent, making the task
+    /// permitted to call `task.cancel`.
     cancel_sent: bool,
+    /// Whether the task completed as cancelled, either before parameter
+    /// lowering began or by acknowledging cancellation through `task.cancel`.
+    cancelled: bool,
     /// Whether or not we've sent a `Status::Starting` event to any current or
     /// future waiters for this waitable.
     starting_sent: bool,
@@ -5228,6 +5330,7 @@ impl GuestTask {
             call_context: CallContext::default(),
             sync_result: SyncResult::NotProduced,
             cancel_sent: false,
+            cancelled: false,
             starting_sent: false,
             instance,
             event: None,
@@ -5525,6 +5628,12 @@ type RawLift = Box<
 /// type by a host caller (or simply ignored in the case of a guest caller; see
 /// `DummyResult`).
 type LiftedResult = Box<dyn Any + Send + Sync>;
+
+/// The terminal call result delivered to a host caller.
+enum HostCallResult {
+    Returned(LiftedResult),
+    Cancelled,
+}
 
 /// Used to return a result from a `LiftFn` when the actual result has already
 /// been lowered to a guest task's stack and linear memory.
@@ -5954,6 +6063,40 @@ impl ConcurrentState {
         Ok(())
     }
 
+    /// Remove queued calls for a guest task whose parameters have not yet been
+    /// lowered.
+    fn remove_guest_task_work_items(&mut self, task: TableId<GuestTask>) -> bool {
+        fn belongs_to_task(item: &WorkItem, task: TableId<GuestTask>) -> bool {
+            matches!(
+                item,
+                WorkItem::GuestCall { call, .. } if call.thread.task == task
+            )
+        }
+
+        let mut removed = false;
+
+        if matches!(
+            self.switch_item.as_ref(),
+            Some(item) if belongs_to_task(item, task)
+        ) {
+            self.switch_item = None;
+            removed = true;
+        }
+
+        self.high_priority.retain(|item| {
+            let keep = !belongs_to_task(item, task);
+            removed |= !keep;
+            keep
+        });
+        self.low_priority.retain(|item| {
+            let keep = !belongs_to_task(item, task);
+            removed |= !keep;
+            keep
+        });
+
+        removed
+    }
+
     fn promote_instance_local_thread_work_item(
         &mut self,
         current_instance: RuntimeInstance,
@@ -5988,6 +6131,75 @@ impl ConcurrentState {
                 ..
             } => *item_thread == thread,
             _ => false,
+        })
+    }
+
+    /// Move one matching low-priority work item to the high-priority queue.
+    ///
+    /// Returns `true` if a matching item was already scheduled as a switch or
+    /// high-priority item, or if one was promoted from the low-priority queue.
+    fn promote_work_item_to_high_priority<F>(&mut self, mut predicate: F) -> bool
+    where
+        F: FnMut(&WorkItem) -> bool,
+    {
+        if let Some(item) = self.switch_item.as_ref()
+            && predicate(item)
+        {
+            return true;
+        }
+
+        if self.high_priority.iter().any(&mut predicate) {
+            return true;
+        }
+
+        let mut promoted = None;
+        for item in mem::take(&mut self.low_priority).into_iter().rev() {
+            if promoted.is_none() && predicate(&item) {
+                promoted = Some(item);
+            } else {
+                self.push_low_priority(item);
+            }
+        }
+
+        if let Some(item) = promoted {
+            self.push_high_priority(item);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move a queued callback event delivery to the high-priority queue.
+    ///
+    /// Callback-based async exports remain in `GuestThreadState::Running`
+    /// after returning `CALLBACK_CODE_YIELD`, so cancellation must identify
+    /// their queued event-delivery work independently of the thread state.
+    fn promote_callback_work_item_to_high_priority(&mut self, thread: QualifiedThreadId) -> bool {
+        self.promote_work_item_to_high_priority(|item| {
+            matches!(
+                item,
+                WorkItem::GuestCall {
+                    call:
+                        GuestCall {
+                            thread: item_thread,
+                            kind: GuestCallKind::DeliverEvent { .. },
+                        },
+                    ..
+                } if *item_thread == thread
+            )
+        })
+    }
+
+    /// Move a queued cancellable fiber resumption to the high-priority queue.
+    fn promote_thread_work_item_to_high_priority(&mut self, thread: QualifiedThreadId) -> bool {
+        self.promote_work_item_to_high_priority(|item| {
+            matches!(
+                item,
+                WorkItem::ResumeThread {
+                    thread: item_thread,
+                    ..
+                } if *item_thread == thread
+            )
         })
     }
 
@@ -6154,29 +6366,66 @@ pub(crate) struct PreparedCall<R> {
     param_count: usize,
     /// The `oneshot::Receiver` to which the result of the call will be
     /// delivered when it is available.
-    rx: oneshot::Receiver<LiftedResult>,
-    /// The instance that this call is prepared for.
-    runtime_instance: RuntimeInstance,
+    rx: oneshot::Receiver<HostCallResult>,
+    /// The handle used to cancel the task or wait for it to exit.
+    task_handle: GuestTaskHandle,
     _phantom: PhantomData<R>,
 }
 
 impl<R> PreparedCall<R> {
-    /// Get a copy of the `TaskId` for this `PreparedCall`.
+    /// Returns the `TaskId` for this `PreparedCall`.
     pub(crate) fn task_id(&self) -> TaskId {
-        TaskId {
-            task: self.thread.task,
-            runtime_instance: self.runtime_instance,
-        }
+        self.task_handle.task_id()
     }
 }
 
 /// Represents a task created by `prepare_call`.
+#[derive(Copy, Clone)]
 pub(crate) struct TaskId {
     task: TableId<GuestTask>,
     runtime_instance: RuntimeInstance,
 }
 
 impl TaskId {
+    fn guest_task_id(&self) -> GuestTaskId {
+        GuestTaskId(self.task)
+    }
+
+    /// Request cancellation for this task.
+    fn cancel(&self, store: &mut StoreOpaque) -> Result<()> {
+        if !store
+            .concurrent_state_mut()?
+            .get_mut(self.task)?
+            .already_lowered_parameters()
+        {
+            let tx = {
+                let task = store.concurrent_state_mut()?.get_mut(self.task)?;
+                match &mut task.caller {
+                    Caller::Host { tx, .. } => tx.take(),
+                    Caller::Guest { .. } => {
+                        bail_bug!("host task handle refers to a guest-called task")
+                    }
+                }
+            };
+            store.cancel_guest_subtask_without_lowered_parameters(
+                self.runtime_instance,
+                self.task,
+            )?;
+            if let Some(tx) = tx {
+                _ = tx.send(HostCallResult::Cancelled);
+            }
+            Waitable::Guest(self.task).delete_from(store.concurrent_state_mut()?)?;
+            return Ok(());
+        }
+
+        _ = store.request_guest_task_cancellation(
+            self.task,
+            CancelAfterReturn::Yes,
+            CancellationDelivery::HighPriority,
+        )?;
+        Ok(())
+    }
+
     /// The host future for an async task was dropped. If the parameters have not been lowered yet,
     /// it is no longer valid to do so, as the lowering closure would see a dangling pointer. In this case,
     /// we delete the task eagerly. Otherwise, there may be running threads, or ones that are suspended
@@ -6240,6 +6489,7 @@ pub(crate) fn prepare_call<T, R>(
     let state = store.0.concurrent_state_mut()?;
 
     let (tx, rx) = oneshot::channel();
+    let task_handle_state = task::GuestTaskHandleState::new();
 
     let instance = handle.instance().runtime_instance(component_instance);
     let thread = GuestTask::new(
@@ -6257,6 +6507,7 @@ pub(crate) fn prepare_call<T, R>(
         },
         Caller::Host {
             tx: Some(tx),
+            task_handle_state: Some(task_handle_state.clone()),
             host_future_present,
             caller,
         },
@@ -6279,20 +6530,29 @@ pub(crate) fn prepare_call<T, R>(
         bail!(Trap::CannotEnterComponent);
     }
 
+    let task_handle = GuestTaskHandle::new(
+        store.0.id(),
+        TaskId {
+            task: thread.task,
+            runtime_instance: instance,
+        },
+        task_handle_state,
+    );
+
     Ok(PreparedCall {
         handle,
         thread,
         param_count,
-        runtime_instance: instance,
         rx,
+        task_handle,
         _phantom: PhantomData,
     })
 }
 
 pub(crate) struct StagedCall<R> {
     store: StoreId,
-    task: TableId<GuestTask>,
-    rx: oneshot::Receiver<LiftedResult>,
+    task_handle: GuestTaskHandle,
+    rx: oneshot::Receiver<HostCallResult>,
     _marker: PhantomData<fn() -> R>,
 }
 
@@ -6312,6 +6572,7 @@ impl<R> StagedCall<R> {
             thread,
             param_count,
             rx,
+            task_handle,
             ..
         } = prepared;
 
@@ -6319,14 +6580,18 @@ impl<R> StagedCall<R> {
 
         Ok(StagedCall {
             store: store.0.id(),
-            task: thread.task,
+            task_handle,
             rx,
             _marker: PhantomData,
         })
     }
 
     fn task(&self) -> GuestTaskId {
-        GuestTaskId(self.task)
+        self.task_handle.id()
+    }
+
+    fn task_handle(&self) -> GuestTaskHandle {
+        self.task_handle.clone()
     }
 }
 
@@ -6339,10 +6604,11 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         check_ambient_store(self.store);
         Pin::new(&mut self.rx).poll(cx).map(|result| match result {
-            Ok(r) => match r.downcast() {
+            Ok(HostCallResult::Returned(r)) => match r.downcast() {
                 Ok(r) => Ok(*r),
                 Err(_) => bail_bug!("wrong type of value produced"),
             },
+            Ok(HostCallResult::Cancelled) => Err(GuestTaskCancelled.into()),
             Err(oneshot::Canceled) => bail_bug!("channel erroneously dropped"),
         })
     }
