@@ -14,12 +14,15 @@ jobs:
     timeout-minutes: 180
     env:
       CARGO_INCREMENTAL: "0"
-      UPSTREAM_SHA: bf330493f4352546ee2a3435eeb85d75d6328f1b
+      UPSTREAM_SHA: 7d4c8b4e8da8ad9d5ba65797baf75aa1ced7a0a6
       PATCH_SHA: e8d20fd15e2b530bfe6342655de02088e3e30e8f
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Install repository test targets
+        run: rustup target add wasm32-wasip2 wasm32-wasip1 wasm32-unknown-unknown
 
       - name: Rebase the reviewed patch
         run: |
