@@ -3071,6 +3071,123 @@ block10:
     }
 
     #[test]
+    fn needs_stack_map_try_call_edge_args() {
+        let _ = env_logger::try_init();
+
+        // Test that values needing stack maps which are passed as block-call
+        // arguments on a `try_call`'s edges are live across the `try_call`,
+        // and are reloaded *after* it, on each edge (see #14452).
+        //
+        //     block0:
+        //       v0 = call fn0()   ;; returns a gc ref
+        //       try_call fn0(), sig0, block1(ret0, v0), [ default: block2(exn0, v0) ]
+        //                         ;; v0 should be in the stack map here
+        //     block1(v1: i32, v2: i32):
+        //       return
+        //     block2(v3: i64, v4: i32):
+        //       return
+
+        let sig = Signature::new(CallConv::SystemV);
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut func = Function::with_name_signature(ir::UserFuncName::testcase("sample"), sig);
+        let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
+
+        // fn0: () -> i32 (returns a gc ref)
+        let name0 = builder
+            .func
+            .declare_imported_user_function(ir::UserExternalName {
+                namespace: 0,
+                index: 0,
+            });
+        let mut sig0 = Signature::new(CallConv::SystemV);
+        sig0.returns.push(AbiParam::new(ir::types::I32));
+        let signature0 = builder.func.import_signature(sig0);
+        let func_ref0 = builder.import_function(ir::ExtFuncData {
+            name: ir::ExternalName::user(name0),
+            signature: signature0,
+            colocated: true,
+            patchable: false,
+        });
+
+        let block0 = builder.create_block();
+        let block1 = builder.create_block();
+        let block2 = builder.create_block();
+        builder.append_block_param(block1, ir::types::I32);
+        builder.append_block_param(block1, ir::types::I32);
+        builder.append_block_param(block2, ir::types::I64);
+        builder.append_block_param(block2, ir::types::I32);
+
+        builder.switch_to_block(block0);
+        let call0 = builder.ins().call(func_ref0, &[]);
+        let v0 = builder.func.dfg.inst_results(call0)[0];
+        builder.declare_value_needs_stack_map(v0);
+
+        let normal_return = BlockCall::new(
+            block1,
+            [ir::BlockArg::TryCallRet(0), ir::BlockArg::Value(v0)],
+            &mut builder.func.dfg.value_lists,
+        );
+        let handler = BlockCall::new(
+            block2,
+            [ir::BlockArg::TryCallExn(0), ir::BlockArg::Value(v0)],
+            &mut builder.func.dfg.value_lists,
+        );
+        let exception_table = builder
+            .func
+            .dfg
+            .exception_tables
+            .push(ExceptionTableData::new(
+                signature0,
+                normal_return,
+                [ir::ExceptionTableItem::Default(handler)],
+            ));
+        builder.ins().try_call(func_ref0, &[], exception_table);
+
+        builder.switch_to_block(block1);
+        builder.ins().return_(&[]);
+
+        builder.switch_to_block(block2);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize(systemv_frontend_config());
+
+        assert_eq_output!(
+            func.display().to_string(),
+            r#"
+function %sample() system_v {
+    ss0 = explicit_slot 4, align = 4
+    sig0 = () -> i32 system_v
+    fn0 = colocated u0:0 sig0
+
+block0:
+    v4 = call fn0()
+    v11 = stack_addr.i64 ss0
+    store notrap aligned v4, v11
+    try_call fn0(), sig0, block4(ret0), [ default: block3(exn0) ], stack_map=[i32 @ ss0+0]
+
+block3(v5: i64):
+    v6 = stack_addr.i64 ss0
+    v7 = load.i32 notrap aligned v6
+    jump block2(v5, v7)
+
+block4(v8: i32):
+    v9 = stack_addr.i64 ss0
+    v10 = load.i32 notrap aligned v9
+    jump block1(v8, v10)
+
+block1(v0: i32, v1: i32):
+    return
+
+block2(v2: i64, v3: i32):
+    return
+}
+            "#
+        );
+    }
+
+    #[test]
     fn rewrite_uses_of_alias_values() {
         let _ = env_logger::try_init();
 
