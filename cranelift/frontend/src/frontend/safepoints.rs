@@ -424,23 +424,59 @@ impl LivenessAnalysis {
         // live-in set inside the currently-live set.
         let mut option_inst = func.layout.last_inst(block);
         while let Some(inst) = option_inst {
-            // Process any needs-stack-map values defined by this instruction.
+            // 1. Process needs-stack-map block-call args. These are
+            // uses that logically happen *after* the instruction --
+            // this matters for `try_call` in particular which is also
+            // a callsite (safepoint).
+            for block_call in func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for val in block_call
+                    .args(&func.dfg.value_lists)
+                    .filter_map(|arg| arg.as_value())
+                {
+                    let val = func.dfg.resolve_aliases(val);
+                    if stack_map_values.contains(val) {
+                        self.process_use(func, inst, val);
+                    }
+                }
+            }
+
+            // 2. Process needs-stack-map defs.
             for val in func.dfg.inst_results(inst) {
                 self.process_def(func, *val);
             }
 
-            // If this instruction is a safepoint and we've been asked to record
-            // safepoints, then do so.
+            // 3. If this instruction is a safepoint and we've been
+            // asked to record safepoints, then do so.
             let opcode = func.dfg.insts[inst].opcode();
             if record_safepoints == RecordSafepoints::Yes && opcode.is_safepoint() {
                 self.record_safepoint(func, inst);
             }
 
-            // Process any needs-stack-map values used by this instruction.
-            for val in func.dfg.inst_values(inst) {
-                let val = func.dfg.resolve_aliases(val);
+            // 4. Process any other needs-stack-map uses.
+            for val in func.dfg.inst_args(inst) {
+                let val = func.dfg.resolve_aliases(*val);
                 if stack_map_values.contains(val) {
                     self.process_use(func, inst, val);
+                }
+            }
+
+            // We do not support GC refs as exception-context values
+            // (Wasmtime uses its vmctx as the
+            // exception-context). Reject this explicitly; this slot
+            // is not handled by the analysis.
+            if let Some(et) = func.dfg.insts[inst].exception_table() {
+                for item in func.dfg.exception_tables[et].items() {
+                    let ir::ExceptionTableItem::Context(ctx) = item else {
+                        continue;
+                    };
+                    let ctx = func.dfg.resolve_aliases(ctx);
+                    assert!(
+                        !stack_map_values.contains(ctx),
+                        "exception-table context {ctx:?} on {inst:?} must not be a \
+                         needs-stack-map value"
+                    );
                 }
             }
 
@@ -775,6 +811,82 @@ impl SafepointSpiller {
         true
     }
 
+    /// Rewrite the outgoing edges of a safepoint instruction that is
+    /// also a branch (i.e. a `try_call` or `try_call_indirect`) such
+    /// that any spilled needs-stack-map values passed as block-call
+    /// arguments are reloaded *after* the safepoint. These uses
+    /// logically occur after the call, not before, so we need to
+    /// split edges to insert these reloads.
+    fn rewrite_safepoint_edges(
+        &mut self,
+        func: &mut Function,
+        block: ir::Block,
+        inst: ir::Inst,
+        pointer_type: ir::Type,
+    ) {
+        let num_dests = func.dfg.insts[inst]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .len();
+        let mut insert_after = block;
+
+        for i in 0..num_dests {
+            let block_call = func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[i];
+            let target = block_call.block(&func.dfg.value_lists);
+            let args: SmallVec<[_; 8]> = block_call.args(&func.dfg.value_lists).collect();
+
+            // Only split this edge if it passes some spilled value.
+            let needs_reload = args.iter().any(|arg| {
+                arg.as_value().is_some_and(|val| {
+                    let val = func.dfg.resolve_aliases(val);
+                    self.liveness.live_across_any_safepoint.contains(val)
+                })
+            });
+            if !needs_reload {
+                continue;
+            }
+
+            let landing = func.dfg.make_block();
+            func.layout.insert_block_after(landing, insert_after);
+            if func.layout.is_cold(target) {
+                func.layout.set_cold(landing);
+            }
+            insert_after = landing;
+            log::trace!(
+                "rewriting:     splitting edge {block:?} -> {target:?} with {landing:?} \
+                 to reload values after {inst:?}"
+            );
+
+            let mut jump_args: SmallVec<[_; 8]> = SmallVec::new();
+            let mut landing_args: SmallVec<[_; 8]> = SmallVec::new();
+            for (j, arg) in args.iter().enumerate() {
+                match *arg {
+                    ir::BlockArg::Value(val) => {
+                        let mut val = func.dfg.resolve_aliases(val);
+                        let mut pos = FuncCursor::new(func).at_bottom(landing);
+                        self.rewrite_use(&mut pos, &mut val, pointer_type);
+                        jump_args.push(ir::BlockArg::Value(val));
+                    }
+                    ir::BlockArg::TryCallRet(_) | ir::BlockArg::TryCallExn(_) => {
+                        let ty = func.dfg.value_type(func.dfg.block_params(target)[j]);
+                        let param = func.dfg.append_block_param(landing, ty);
+                        landing_args.push(*arg);
+                        jump_args.push(ir::BlockArg::Value(param));
+                    }
+                }
+            }
+
+            let mut pos = FuncCursor::new(func).at_bottom(landing);
+            pos.ins().jump(target, &jump_args);
+            let new_block_call =
+                ir::BlockCall::new(landing, landing_args, &mut func.dfg.value_lists);
+            let dfg = &mut func.dfg;
+            dfg.insts[inst]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[i] =
+                new_block_call;
+        }
+    }
+
     /// Rewrite the function's instructions to spill and reload values that are
     /// live across safepoints:
     ///
@@ -833,6 +945,11 @@ impl SafepointSpiller {
                 // across it.
                 if self.liveness.safepoints.contains_key(&inst) {
                     self.rewrite_safepoint(func, inst);
+
+                    // If this safepoint is also a branch (i.e. a `try_call`),
+                    // then values it passes along its edges must be reloaded
+                    // *after* the call, on the edge, rather than before it.
+                    self.rewrite_safepoint_edges(func, block, inst, pointer_type);
                 }
 
                 // Replace all uses of needs-stack-map values with loads from
