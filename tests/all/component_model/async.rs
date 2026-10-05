@@ -973,6 +973,224 @@ async fn bytes_stream_producer() -> Result<()> {
 
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
+async fn cancel_call_concurrent_task() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    let engine = Engine::new(&config)?;
+
+    let component = Component::new(
+        &engine,
+        r#"
+(component
+  (import "started" (func $started))
+  (core func $started (canon lower (func $started)))
+
+  (core module $m
+    (import "" "started" (func $started))
+    (import "" "task.return" (func $task-return))
+    (import "" "task.cancel" (func $task-cancel))
+
+    ;; A cancellation request before this function starts is handled entirely
+    ;; by the host and therefore never reaches this body.
+    (func (export "cancel-before-start") (result i32)
+      unreachable
+    )
+    (func (export "cancel-before-start-callback") (param i32 i32 i32) (result i32)
+      unreachable
+    )
+
+    ;; Wait for EVENT_CANCELLED and acknowledge it with task.cancel.
+    (func (export "cancel") (result i32)
+      call $started
+      i32.const 1 ;; CALLBACK_CODE_YIELD
+    )
+    (func (export "cancel-callback") (param i32 i32 i32) (result i32)
+      (if (result i32)
+        (i32.eq (local.get 0) (i32.const 6 (; EVENT_CANCELLED ;)))
+        (then
+          call $task-cancel
+          i32.const 0 ;; CALLBACK_CODE_EXIT
+        )
+        (else
+          i32.const 1 ;; CALLBACK_CODE_YIELD
+        )
+      )
+    )
+
+    ;; A guest may respond to cancellation by returning normally.
+    (func (export "return-after-cancel") (result i32)
+      call $started
+      i32.const 1 ;; CALLBACK_CODE_YIELD
+    )
+    (func (export "return-after-cancel-callback") (param i32 i32 i32) (result i32)
+      (if (result i32)
+        (i32.eq (local.get 0) (i32.const 6 (; EVENT_CANCELLED ;)))
+        (then
+          call $task-return
+          i32.const 0 ;; CALLBACK_CODE_EXIT
+        )
+        (else
+          i32.const 1 ;; CALLBACK_CODE_YIELD
+        )
+      )
+    )
+
+    ;; Return a result first, then remain alive until cancellation is requested.
+    (func (export "return-then-wait") (result i32)
+      call $started
+      call $task-return
+      i32.const 1 ;; CALLBACK_CODE_YIELD
+    )
+    (func (export "return-then-wait-callback") (param i32 i32 i32) (result i32)
+      (if (result i32)
+        (i32.eq (local.get 0) (i32.const 6 (; EVENT_CANCELLED ;)))
+        (then
+          i32.const 0 ;; CALLBACK_CODE_EXIT
+        )
+        (else
+          i32.const 1 ;; CALLBACK_CODE_YIELD
+        )
+      )
+    )
+  )
+
+  (core func $task-return (canon task.return))
+  (core func $task-cancel (canon task.cancel))
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "started" (func $started))
+      (export "task.return" (func $task-return))
+      (export "task.cancel" (func $task-cancel))
+    ))
+  ))
+
+  (func (export "cancel-before-start") async
+    (canon lift
+      (core func $i "cancel-before-start")
+      async
+      (callback (core func $i "cancel-before-start-callback"))
+    )
+  )
+  (func (export "cancel") async
+    (canon lift
+      (core func $i "cancel")
+      async
+      (callback (core func $i "cancel-callback"))
+    )
+  )
+  (func (export "return-after-cancel") async
+    (canon lift
+      (core func $i "return-after-cancel")
+      async
+      (callback (core func $i "return-after-cancel-callback"))
+    )
+  )
+  (func (export "return-then-wait") async
+    (canon lift
+      (core func $i "return-then-wait")
+      async
+      (callback (core func $i "return-then-wait-callback"))
+    )
+  )
+)
+        "#,
+    )?;
+
+    let mut linker = Linker::<usize>::new(&engine);
+    linker
+        .root()
+        .func_wrap("started", |mut store: StoreContextMut<usize>, (): ()| {
+            *store.data_mut() += 1;
+            Ok(())
+        })?;
+
+    let mut store = Store::new(&engine, 0);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+
+    // Cancelling immediately after `start_call_concurrent` must remove the
+    // queued call before parameter lowering starts.
+    let func = instance.get_typed_func::<(), ()>(&mut store, "cancel-before-start")?;
+    store
+        .run_concurrent(async |accessor| -> Result<()> {
+            let call = accessor.with(|store| func.start_call_concurrent(store, ()))?;
+            let task = call.task_handle();
+            assert_eq!(task.id(), call.task());
+            task.cancel(accessor)?;
+            let err = func
+                .finish_call_concurrent(accessor, call)
+                .await
+                .unwrap_err();
+            assert!(err.is::<GuestTaskCancelled>());
+            task.task_done(accessor).await;
+            Ok(())
+        })
+        .await??;
+
+    // Once the guest is running, cancellation is delivered as EVENT_CANCELLED
+    // and `task.cancel` is reflected as a typed host error.
+    let func = instance.get_typed_func::<(), ()>(&mut store, "cancel")?;
+    store
+        .run_concurrent(async |accessor| -> Result<()> {
+            let call = accessor.with(|store| func.start_call_concurrent(store, ()))?;
+            let task = call.task_handle();
+            while accessor.with(|mut store| *store.data_mut()) < 1 {
+                tokio::task::yield_now().await;
+            }
+            task.cancel(accessor)?;
+            let err = func
+                .finish_call_concurrent(accessor, call)
+                .await
+                .unwrap_err();
+            assert!(err.is::<GuestTaskCancelled>());
+            // Cancellation is idempotent even before the task's callback has
+            // returned `CALLBACK_CODE_EXIT`.
+            task.cancel(accessor)?;
+            task.task_done(accessor).await;
+            Ok(())
+        })
+        .await??;
+
+    // Cancellation is only a request: the guest may still return normally.
+    let func = instance.get_typed_func::<(), ()>(&mut store, "return-after-cancel")?;
+    store
+        .run_concurrent(async |accessor| -> Result<()> {
+            let call = accessor.with(|store| func.start_call_concurrent(store, ()))?;
+            let task = call.task_handle();
+            while accessor.with(|mut store| *store.data_mut()) < 2 {
+                tokio::task::yield_now().await;
+            }
+            task.cancel(accessor)?;
+            func.finish_call_concurrent(accessor, call).await?;
+            task.task_done(accessor).await;
+            Ok(())
+        })
+        .await??;
+
+    // A result may arrive before the task exits. The retained handle can still
+    // cancel the task and then wait for its actual completion.
+    let func = instance.get_typed_func::<(), ()>(&mut store, "return-then-wait")?;
+    store
+        .run_concurrent(async |accessor| -> Result<()> {
+            let call = accessor.with(|store| func.start_call_concurrent(store, ()))?;
+            let task = call.task_handle();
+            func.finish_call_concurrent(accessor, call).await?;
+            assert_eq!(accessor.with(|mut store| *store.data_mut()), 3);
+            task.cancel(accessor)?;
+            task.task_done(accessor).await;
+            // Cancellation is also a no-op once the task has exited.
+            task.cancel(accessor)?;
+            Ok(())
+        })
+        .await??;
+
+    assert_eq!(*store.data(), 3);
+    store.assert_concurrent_state_empty();
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
 async fn async_call_stack() -> Result<()> {
     let mut config = Config::new();
     config.wasm_component_model_async(true);
